@@ -5,7 +5,7 @@ Install in a virtual environment:
     python3.12 -m venv .venv
     source .venv/bin/activate
     python -m pip install 'numpy<2' 'opencv-python==4.11.0.86' 'opencv-contrib-python==4.11.0.86' 'mediapipe==0.10.21' pyautogui
-    python hand_tracker_swipe_spaces.py
+    python hand_tracker_pinch_windows.py
 
 In System Settings > Privacy & Security, enable Camera and Accessibility
 for the terminal/app running Python, then restart it. Ensure Control+Left/Right
@@ -18,10 +18,17 @@ Run with --dry-run to detect gestures without sending shortcuts.
 Gestures pause when hand boxes overlap, handedness is uncertain, or tracking
 jumps. Separate hands and allow 0.35 seconds of consistent tracking to rearm.
 Raw landmark drawings/data are still shown and may jitter during occlusion.
+Click the window you want to move, show an open hand, then pinch thumb and
+index together for 0.12 seconds. Move your pinched hand; open it to release.
+The target is the focused window at grab time, not the window under your hand.
+Window dragging uses native Accessibility (no extra dependency), is limited
+to the primary display, and requires a normal movable, non-full-screen window.
+Swipes are suppressed while pinching. Tracking ambiguity releases the grab.
 Z is wrist-relative depth scaled by image width, not physical distance.
 """
 
 import sys
+import math
 import time
 from datetime import datetime
 from collections import deque
@@ -31,11 +38,199 @@ import mediapipe as mp
 
 
 TIPS = {"Thumb": 4, "Index": 8, "Middle": 12, "Ring": 16, "Pinky": 20}
-WINDOW = "Swipe to switch Spaces | Q to quit"
+WINDOW = "Pinch to move windows | Swipe for Spaces | Q to quit"
 SWIPE_DISTANCE = 0.25  # Fraction of frame width.
 MAX_VERTICAL_DRIFT = 0.10  # Fraction of frame height, across the entire path.
 SWIPE_SECONDS = 0.5
 COOLDOWN_SECONDS = 1.0
+
+
+class MacWindowMover:
+    """Move a retained focused AX window without clicking or dragging its contents."""
+
+    def __init__(self):
+        import ctypes as C
+        self.C = C
+        class Point(C.Structure):
+            _fields_ = [("x", C.c_double), ("y", C.c_double)]
+        self.Point = Point
+        self.ax = C.CDLL('/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices')
+        self.cf = C.CDLL('/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation')
+        def bind(lib, name, result, args):
+            fn = getattr(lib, name)
+            fn.restype, fn.argtypes = result, args
+        P, I, B = C.c_void_p, C.c_int, C.c_bool
+        bind(self.cf, 'CFStringCreateWithCString', P, [P, C.c_char_p, C.c_uint32])
+        bind(self.cf, 'CFRelease', None, [P])
+        bind(self.cf, 'CFBooleanGetValue', B, [P])
+        bind(self.ax, 'AXIsProcessTrusted', B, [])
+        bind(self.ax, 'AXUIElementCreateSystemWide', P, [])
+        bind(self.ax, 'AXUIElementCopyAttributeValue', I, [P, P, C.POINTER(P)])
+        bind(self.ax, 'AXUIElementIsAttributeSettable', I, [P, P, C.POINTER(B)])
+        bind(self.ax, 'AXUIElementSetAttributeValue', I, [P, P, P])
+        bind(self.ax, 'AXUIElementSetMessagingTimeout', I, [P, C.c_float])
+        bind(self.ax, 'AXValueGetValue', B, [P, I, P])
+        bind(self.ax, 'AXValueCreate', P, [I, P])
+        self.window = None
+        self.names = {}
+
+    def name(self, text):
+        if text not in self.names:
+            self.names[text] = self.cf.CFStringCreateWithCString(None, text.encode(), 0x08000100)
+        return self.names[text]
+
+    def get(self, element, attribute):
+        value = self.C.c_void_p()
+        error = self.ax.AXUIElementCopyAttributeValue(element, self.name(attribute), self.C.byref(value))
+        if error or not value.value:
+            raise RuntimeError(f'Cannot read {attribute} (Accessibility error {error})')
+        return value.value
+
+    def grab(self):
+        self.release()
+        if not self.ax.AXIsProcessTrusted():
+            raise RuntimeError('Enable Accessibility for your terminal/app, then restart it')
+        system = self.ax.AXUIElementCreateSystemWide()
+        app = None
+        try:
+            self.ax.AXUIElementSetMessagingTimeout(system, 0.15)
+            app = self.get(system, 'AXFocusedApplication')
+            self.window = self.get(app, 'AXFocusedWindow')
+            self.ax.AXUIElementSetMessagingTimeout(self.window, 0.15)
+            try:
+                full = self.get(self.window, 'AXFullScreen')
+            except RuntimeError:
+                full = None  # Not every app exposes this optional attribute.
+            if full:
+                try:
+                    if self.cf.CFBooleanGetValue(full):
+                        raise RuntimeError('Exit full-screen mode before grabbing this window')
+                finally:
+                    self.cf.CFRelease(full)
+            writable = self.C.c_bool()
+            error = self.ax.AXUIElementIsAttributeSettable(self.window, self.name('AXPosition'), self.C.byref(writable))
+            if error or not writable.value:
+                raise RuntimeError('This focused window does not support moving')
+            value = self.get(self.window, 'AXPosition')
+            try:
+                point = self.Point()
+                if not self.ax.AXValueGetValue(value, 1, self.C.byref(point)):
+                    raise RuntimeError('Cannot read window position')
+                return point.x, point.y
+            finally:
+                self.cf.CFRelease(value)
+        except Exception:
+            self.release()
+            raise
+        finally:
+            if app:
+                self.cf.CFRelease(app)
+            self.cf.CFRelease(system)
+
+    def move(self, x, y):
+        point = self.Point(x, y)
+        value = self.ax.AXValueCreate(1, self.C.byref(point))
+        if not value:
+            raise RuntimeError('Cannot create window position')
+        try:
+            error = self.ax.AXUIElementSetAttributeValue(self.window, self.name('AXPosition'), value)
+            if error:
+                raise RuntimeError(f'Window move failed (Accessibility error {error})')
+        finally:
+            self.cf.CFRelease(value)
+
+    def release(self):
+        if self.window:
+            self.cf.CFRelease(self.window)
+            self.window = None
+
+    def close(self):
+        self.release()
+        for value in self.names.values():
+            self.cf.CFRelease(value)
+        self.names.clear()
+
+
+class PinchDrag:
+    """Open-to-pinch transition, hysteresis, and exclusive gesture ownership."""
+    def __init__(self, mover, screen_size):
+        self.mover = mover
+        self.screen = screen_size
+        self.armed = set()
+        self.owner = None
+        self.pending = None
+        self.since = 0.0
+        self.filtered = None
+        self.last_time = 0.0
+        self.block_until = 0.0
+        self.status = 'Open fingers, then pinch thumb + index to grab'
+
+    def release(self, now):
+        if self.mover:
+            self.mover.release()
+        self.owner = self.pending = None
+        self.armed.clear()
+        self.block_until = now + 0.4
+
+    def update(self, now, tracked, width, height, tracking_ok):
+        states = {}
+        for side, joints, _ in tracked:
+            distance = lambda a, b: math.hypot(joints[a][0]-joints[b][0], joints[a][1]-joints[b][1])
+            scale = max(distance(0, 9), distance(5, 17), 1.0)
+            ratio = distance(4, 8) / scale
+            center = ((joints[4][0]+joints[8][0])/(2*width),
+                      (joints[4][1]+joints[8][1])/(2*height))
+            states[side] = (ratio, center)
+        if not tracking_ok:
+            self.release(now)
+            self.status = 'Grab paused: waiting for stable tracking'
+            return True
+        self.armed.intersection_update(states)
+        if self.owner:
+            if self.owner not in states or states[self.owner][0] > 0.48:
+                self.release(now)
+                self.status = 'Released - open fingers before grabbing again'
+                return True
+            center = states[self.owner][1]
+            # Time-based smoothing; relative movement avoids a jump on initial grab.
+            alpha = 1 - math.exp(-max(0, now-self.last_time)/0.05)
+            self.filtered = tuple(a + alpha*(b-a) for a,b in zip(self.filtered, center))
+            self.last_time = now
+            x = self.origin[0] + (self.filtered[0]-self.anchor[0])*self.screen[0]*1.6
+            y = self.origin[1] + (self.filtered[1]-self.anchor[1])*self.screen[1]*1.6
+            # Keep the title-bar origin reachable on the primary display.
+            x, y = max(0, min(x, self.screen[0]-100)), max(25, min(y, self.screen[1]-60))
+            try:
+                if self.mover:
+                    self.mover.move(round(x), round(y))
+                self.status = f'Grabbing with {self.owner}: ({x:.0f}, {y:.0f})'
+            except RuntimeError as exc:
+                self.release(now)
+                self.status = str(exc)
+            return True
+        for side, (ratio, _) in states.items():
+            if ratio > 0.55:
+                self.armed.add(side)
+        candidates = [side for side, (ratio, _) in states.items() if ratio < 0.30 and side in self.armed]
+        if len(candidates) == 1 and now >= self.block_until:
+            side = candidates[0]
+            if self.pending != side:
+                self.pending, self.since = side, now
+            elif now - self.since >= 0.12:
+                try:
+                    self.origin = self.mover.grab() if self.mover else (100, 100)
+                    self.owner = side
+                    self.anchor = self.filtered = states[side][1]
+                    self.last_time = now
+                    self.pending = None
+                    self.status = f'Grabbed focused window with {side}'
+                except RuntimeError as exc:
+                    self.release(now)
+                    self.status = str(exc)
+            return True
+        self.pending = None
+        # Suppress swipes while any hand is closed, even if it was not armed.
+        return now < self.block_until or any(ratio < 0.48 for ratio, _ in states.values())
 
 
 class SwipeDetector:
@@ -155,6 +350,8 @@ def main():
         keyboard = pyautogui
     detectors = {side: SwipeDetector() for side in ("Left", "Right")}
     guard = TrackingGuard()
+    mover = MacWindowMover() if not dry_run else None
+    drag = PinchDrag(mover, tuple(keyboard.size()) if keyboard else (1440, 900))
     cooldown_until = 0.0
     last_gesture = "Ready: swipe horizontally"
     if not hasattr(mp, "solutions"):
@@ -211,7 +408,11 @@ def main():
 
                 gesture_time = time.monotonic()
                 tracking_ok, tracking_status = guard.update(gesture_time, observations)
-                if not tracking_ok or gesture_time < cooldown_until:
+                if keyboard is not None:
+                    keyboard.failSafeCheck()
+                drag_busy = drag.update(gesture_time, tracked, width, height,
+                                        tracking_ok and gesture_time >= cooldown_until)
+                if not tracking_ok or drag_busy or gesture_time < cooldown_until:
                     for detector in detectors.values():
                         detector.reset()
                 else:
@@ -277,6 +478,7 @@ def main():
                 label(canvas, last_gesture, (12, 55))
                 status = f"Cooldown: {remaining:.1f}s" if remaining else tracking_status
                 label(canvas, status, (12, 82))
+                label(canvas, drag.status, (12, 109), scale=0.45)
                 now = time.monotonic()
                 if now - last_print >= 0.5:
                     stamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
@@ -298,6 +500,8 @@ def main():
                 if cv2.getWindowProperty(WINDOW, cv2.WND_PROP_VISIBLE) < 1:
                     break
     finally:
+        if mover:
+            mover.close()
         cap.release()
         cv2.destroyAllWindows()
 
