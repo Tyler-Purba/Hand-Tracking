@@ -4,8 +4,8 @@
 Install in a virtual environment:
     python3.12 -m venv .venv
     source .venv/bin/activate
-    python -m pip install 'numpy<2' 'opencv-python==4.11.0.86' 'opencv-contrib-python==4.11.0.86' 'mediapipe==0.10.21' pyautogui
-    python hand_tracker_pinch_windows.py
+    python -m pip install 'numpy<2' 'opencv-python==4.11.0.86' 'opencv-contrib-python==4.11.0.86' 'mediapipe==0.10.21' pyautogui pyobjc-framework-Cocoa pyobjc-framework-Quartz
+    python hand_tracker_visual_grab.py
 
 In System Settings > Privacy & Security, enable Camera and Accessibility
 for the terminal/app running Python, then restart it. Ensure Control+Left/Right
@@ -18,16 +18,20 @@ Run with --dry-run to detect gestures without sending shortcuts.
 Gestures pause when hand boxes overlap, handedness is uncertain, or tracking
 jumps. Separate hands and allow 0.35 seconds of consistent tracking to rearm.
 Raw landmark drawings/data are still shown and may jitter during occlusion.
-Click the window you want to move, show an open hand, then pinch thumb and
-index together for 0.12 seconds. Move your pinched hand; open it to release.
-The target is the focused window at grab time, not the window under your hand.
-Window dragging uses native Accessibility (no extra dependency), is limited
-to the primary display, and requires a normal movable, non-full-screen window.
-Swipes are suppressed while pinching. Tracking ambiguity releases the grab.
+A desktop ring follows the thumb/index midpoint of one controlling hand.
+Blue outline = target; yellow filling ring = pinch registering; green = grabbed;
+gray = paused/no movable target. Open your fingers before each pinch.
+Point at any visible normal window, even an inactive app, and pinch for 0.18
+seconds to lock the highlighted target. Focus does not determine the target.
+Open fingers to release. The other hand can still swipe when not pinching.
+Uses the primary display and normal movable windows, not full-screen windows.
+Tracking ambiguity releases the grab. --dry-run shows a demo target and never
+moves windows or sends keyboard shortcuts. Requires pyobjc-framework-Cocoa.
 Z is wrist-relative depth scaled by image width, not physical distance.
 """
 
 import sys
+import os
 import math
 import time
 from datetime import datetime
@@ -38,15 +42,31 @@ import mediapipe as mp
 
 
 TIPS = {"Thumb": 4, "Index": 8, "Middle": 12, "Ring": 16, "Pinky": 20}
-WINDOW = "Pinch to move windows | Swipe for Spaces | Q to quit"
+WINDOW = "Visual grab | Swipe for Spaces | Q to quit"
 SWIPE_DISTANCE = 0.25  # Fraction of frame width.
 MAX_VERTICAL_DRIFT = 0.10  # Fraction of frame height, across the entire path.
 SWIPE_SECONDS = 0.5
 COOLDOWN_SECONDS = 1.0
 
 
+def window_under_cursor(windows, cursor, own_pid):
+    """Select the frontmost normal window at the point, regardless of app focus."""
+    x, y = cursor
+    for info in windows:
+        if (info.get('kCGWindowOwnerPID') == own_pid
+                or info.get('kCGWindowLayer', 0) != 0
+                or info.get('kCGWindowAlpha', 1) <= 0):
+            continue
+        box = info.get('kCGWindowBounds', {})
+        bx, by = box.get('X', 0), box.get('Y', 0)
+        bw, bh = box.get('Width', 0), box.get('Height', 0)
+        if bx <= x < bx+bw and by <= y < by+bh:
+            return info
+    return None
+
+
 class MacWindowMover:
-    """Move a retained focused AX window without clicking or dragging its contents."""
+    """Move a retained targeted AX window without clicking or dragging its contents."""
 
     def __init__(self):
         import ctypes as C
@@ -62,6 +82,12 @@ class MacWindowMover:
         P, I, B = C.c_void_p, C.c_int, C.c_bool
         bind(self.cf, 'CFStringCreateWithCString', P, [P, C.c_char_p, C.c_uint32])
         bind(self.cf, 'CFRelease', None, [P])
+        bind(self.cf, 'CFEqual', B, [P, P])
+        bind(self.cf, 'CFRetain', P, [P])
+        bind(self.cf, 'CFArrayGetCount', C.c_long, [P])
+        bind(self.cf, 'CFArrayGetValueAtIndex', P, [P, C.c_long])
+        bind(self.ax, 'AXUIElementCreateApplication', P, [I])
+        bind(self.ax, 'AXUIElementCopyElementAtPosition', I, [P, C.c_float, C.c_float, C.POINTER(P)])
         bind(self.cf, 'CFBooleanGetValue', B, [P])
         bind(self.ax, 'AXIsProcessTrusted', B, [])
         bind(self.ax, 'AXUIElementCreateSystemWide', P, [])
@@ -86,16 +112,41 @@ class MacWindowMover:
             raise RuntimeError(f'Cannot read {attribute} (Accessibility error {error})')
         return value.value
 
-    def grab(self):
+    def grab(self, cursor):
         self.release()
         if not self.ax.AXIsProcessTrusted():
             raise RuntimeError('Enable Accessibility for your terminal/app, then restart it')
-        system = self.ax.AXUIElementCreateSystemWide()
-        app = None
+        import Quartz as Q
+        windows = Q.CGWindowListCopyWindowInfo(
+            Q.kCGWindowListOptionOnScreenOnly | Q.kCGWindowListExcludeDesktopElements,
+            Q.kCGNullWindowID) or []
+        target = window_under_cursor(windows, cursor, os.getpid())
+        if target is None:
+            raise RuntimeError('Point at a visible application window')
+        box = target['kCGWindowBounds']
+        expected = tuple(float(box[k]) for k in ('X', 'Y', 'Width', 'Height'))
+        app = self.ax.AXUIElementCreateApplication(int(target['kCGWindowOwnerPID']))
         try:
-            self.ax.AXUIElementSetMessagingTimeout(system, 0.15)
-            app = self.get(system, 'AXFocusedApplication')
-            self.window = self.get(app, 'AXFocusedWindow')
+            self.ax.AXUIElementSetMessagingTimeout(app, 0.15)
+            # Enumerate this app's windows, including inactive windows. Never fall
+            # back to AXFocusedWindow: that can silently grab the wrong window.
+            array = self.get(app, 'AXWindows')
+            try:
+                best, best_error = None, float('inf')
+                for index in range(self.cf.CFArrayGetCount(array)):
+                    candidate = self.cf.CFArrayGetValueAtIndex(array, index)
+                    try:
+                        actual = self.bounds(candidate)
+                    except RuntimeError:
+                        continue
+                    error = max(abs(a-b) for a,b in zip(actual, expected))
+                    if error < best_error:
+                        best, best_error = candidate, error
+                if best is None or best_error > 8:
+                    raise RuntimeError('Hovered window does not expose matching Accessibility bounds')
+                self.window = self.cf.CFRetain(best)
+            finally:
+                self.cf.CFRelease(array)
             self.ax.AXUIElementSetMessagingTimeout(self.window, 0.15)
             try:
                 full = self.get(self.window, 'AXFullScreen')
@@ -110,7 +161,7 @@ class MacWindowMover:
             writable = self.C.c_bool()
             error = self.ax.AXUIElementIsAttributeSettable(self.window, self.name('AXPosition'), self.C.byref(writable))
             if error or not writable.value:
-                raise RuntimeError('This focused window does not support moving')
+                raise RuntimeError('This hovered window does not support moving')
             value = self.get(self.window, 'AXPosition')
             try:
                 point = self.Point()
@@ -125,7 +176,19 @@ class MacWindowMover:
         finally:
             if app:
                 self.cf.CFRelease(app)
-            self.cf.CFRelease(system)
+
+    def bounds(self, window=None):
+        values = []
+        for attribute, kind in (('AXPosition', 1), ('AXSize', 2)):
+            ref = self.get(window or self.window, attribute)
+            try:
+                pair = self.Point()
+                if not self.ax.AXValueGetValue(ref, kind, self.C.byref(pair)):
+                    raise RuntimeError('Cannot read target window bounds')
+                values.extend((pair.x, pair.y))
+            finally:
+                self.cf.CFRelease(ref)
+        return tuple(values)
 
     def move(self, x, y):
         point = self.Point(x, y)
@@ -151,86 +214,179 @@ class MacWindowMover:
         self.names.clear()
 
 
+class DesktopOverlay:
+    """Click-through Cocoa overlay; all coordinates are primary-display points."""
+    def __init__(self):
+        import AppKit as A
+        self.A = A
+        A.NSApplication.sharedApplication()
+        screen = A.NSScreen.screens()[0]
+        rect = screen.frame()
+        self.size = (rect.size.width, rect.size.height)
+        class GrabOverlayView(A.NSView):
+            def isFlipped(self):
+                return True
+            def isOpaque(self):
+                return False
+            def drawRect_(self, rect):
+                try:
+                    A.NSColor.clearColor().set()
+                    A.NSRectFillUsingOperation(self.bounds(), A.NSCompositingOperationCopy)
+                    state = getattr(self, 'state', None)
+                    if not state:
+                        return
+                    cursor, box, mode, progress = state
+                    colors = {'ready': (0.2, 0.75, 1.0), 'pinch': (1.0, 0.75, 0.15),
+                              'grab': (0.2, 1.0, 0.5), 'paused': (0.6, 0.6, 0.6)}
+                    r, g, b = colors[mode]
+                    color = A.NSColor.colorWithCalibratedRed_green_blue_alpha_(r,g,b,0.95)
+                    color.set()
+                    if box:
+                        x,y,w,h = box
+                        path = A.NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(((x+2,y+2),(max(1,w-4),max(1,h-4))),10,10)
+                        path.setLineWidth_(4)
+                        path.stroke()
+                    if cursor:
+                        x,y = cursor
+                        ring = A.NSBezierPath.bezierPathWithOvalInRect_(((x-16,y-16),(32,32)))
+                        ring.setLineWidth_(3)
+                        ring.stroke()
+                        radius = 12 * (1 if mode == 'grab' else progress)
+                        if radius > 0:
+                            A.NSBezierPath.bezierPathWithOvalInRect_(((x-radius,y-radius),(2*radius,2*radius))).fill()
+                        A.NSBezierPath.bezierPathWithOvalInRect_(((x-2,y-2),(4,4))).fill()
+                except Exception as exc:
+                    # Never let a Python exception escape a native drawing callback.
+                    self.render_error = f"Desktop overlay drawing failed: {exc}"
+        self.view = GrabOverlayView.alloc().initWithFrame_(((0,0),self.size))
+        self.view.setAccessibilityElement_(False)
+        self.window = A.NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(rect, A.NSWindowStyleMaskBorderless, A.NSBackingStoreBuffered, False)
+        self.window.setReleasedWhenClosed_(False)
+        self.window.setOpaque_(False)
+        self.window.setBackgroundColor_(A.NSColor.clearColor())
+        self.window.setHasShadow_(False)
+        self.window.setIgnoresMouseEvents_(True)
+        self.window.setLevel_(A.NSStatusWindowLevel)
+        self.window.setCollectionBehavior_(A.NSWindowCollectionBehaviorCanJoinAllSpaces | A.NSWindowCollectionBehaviorFullScreenAuxiliary | A.NSWindowCollectionBehaviorIgnoresCycle)
+        self.window.setContentView_(self.view)
+        self.window.orderFrontRegardless()
+
+    def draw(self, cursor, box, mode, progress=0):
+        error = getattr(self.view, 'render_error', None)
+        if error:
+            raise RuntimeError(error)
+        self.view.state = (cursor, box, mode, progress)
+        self.view.setNeedsDisplay_(True)
+        self.window.displayIfNeeded()
+
+    def close(self):
+        self.window.orderOut_(None)
+        self.window.close()
+
+
 class PinchDrag:
-    """Open-to-pinch transition, hysteresis, and exclusive gesture ownership."""
     def __init__(self, mover, screen_size):
-        self.mover = mover
-        self.screen = screen_size
+        self.mover, self.screen = mover, screen_size
+        self.owner = self.pending = self.pointer_side = None
+        self.cursor = self.box = None
+        self.mode, self.progress = 'paused', 0
         self.armed = set()
-        self.owner = None
-        self.pending = None
-        self.since = 0.0
-        self.filtered = None
-        self.last_time = 0.0
-        self.block_until = 0.0
-        self.status = 'Open fingers, then pinch thumb + index to grab'
+        self.since = self.last_time = self.block_until = 0.0
+        self.status = 'Point at a window, then pinch thumb + index'
 
     def release(self, now):
         if self.mover:
             self.mover.release()
         self.owner = self.pending = None
+        self.box = None
         self.armed.clear()
         self.block_until = now + 0.4
+        self.mode, self.progress = 'paused', 0
 
     def update(self, now, tracked, width, height, tracking_ok):
         states = {}
         for side, joints, _ in tracked:
-            distance = lambda a, b: math.hypot(joints[a][0]-joints[b][0], joints[a][1]-joints[b][1])
-            scale = max(distance(0, 9), distance(5, 17), 1.0)
-            ratio = distance(4, 8) / scale
-            center = ((joints[4][0]+joints[8][0])/(2*width),
-                      (joints[4][1]+joints[8][1])/(2*height))
-            states[side] = (ratio, center)
-        if not tracking_ok:
+            distance = lambda a,b: math.hypot(joints[a][0]-joints[b][0], joints[a][1]-joints[b][1])
+            ratio = distance(4,8)/max(distance(0,9),distance(5,17),1)
+            # Use the central 70% of the camera to reach the whole primary display.
+            center = ((joints[4][0]+joints[8][0])/(2*width), (joints[4][1]+joints[8][1])/(2*height))
+            point = tuple(max(0,min(1,(v-.15)/.7))*(size-1) for v,size in zip(center,self.screen))
+            states[side] = ratio, point
+        if not tracking_ok or not states:
             self.release(now)
-            self.status = 'Grab paused: waiting for stable tracking'
+            self.cursor = None if not states else self.cursor
+            self.status = 'Paused: separate hands and wait for stable tracking'
             return True
+        if (self.owner or self.pending) and (self.owner or self.pending) not in states:
+            self.release(now)
+            self.status = 'Controlling hand lost - open fingers to rearm'
+            return True
+        # One visible controller avoids competing target windows from two hands.
+        side = self.owner or self.pending or self.pointer_side
+        if side not in states:
+            side = sorted(states)[0]
+            self.cursor = None
+        self.pointer_side = side
+        ratio, point = states[side]
+        dt = max(0,now-self.last_time)
+        alpha = 1-math.exp(-dt/.045)
+        self.cursor = point if self.cursor is None else tuple(a+alpha*(b-a) for a,b in zip(self.cursor,point))
+        self.last_time = now
         self.armed.intersection_update(states)
+        if ratio > .55:
+            self.armed.add(side)
         if self.owner:
-            if self.owner not in states or states[self.owner][0] > 0.48:
+            if ratio > .48:
                 self.release(now)
-                self.status = 'Released - open fingers before grabbing again'
+                self.status = 'Released'
                 return True
-            center = states[self.owner][1]
-            # Time-based smoothing; relative movement avoids a jump on initial grab.
-            alpha = 1 - math.exp(-max(0, now-self.last_time)/0.05)
-            self.filtered = tuple(a + alpha*(b-a) for a,b in zip(self.filtered, center))
-            self.last_time = now
-            x = self.origin[0] + (self.filtered[0]-self.anchor[0])*self.screen[0]*1.6
-            y = self.origin[1] + (self.filtered[1]-self.anchor[1])*self.screen[1]*1.6
-            # Keep the title-bar origin reachable on the primary display.
-            x, y = max(0, min(x, self.screen[0]-100)), max(25, min(y, self.screen[1]-60))
+            x = self.origin[0]+self.cursor[0]-self.anchor[0]
+            y = self.origin[1]+self.cursor[1]-self.anchor[1]
+            x,y = max(0,min(x,self.screen[0]-100)),max(25,min(y,self.screen[1]-60))
             try:
                 if self.mover:
-                    self.mover.move(round(x), round(y))
-                self.status = f'Grabbing with {self.owner}: ({x:.0f}, {y:.0f})'
+                    self.mover.move(round(x),round(y))
+                    self.box = self.mover.bounds()
+                else:
+                    self.box = (x,y,self.box[2],self.box[3])
+                self.mode = 'grab'
+                self.status = f'Grabbing with {side} - open fingers to release'
             except RuntimeError as exc:
                 self.release(now)
                 self.status = str(exc)
             return True
-        for side, (ratio, _) in states.items():
-            if ratio > 0.55:
-                self.armed.add(side)
-        candidates = [side for side, (ratio, _) in states.items() if ratio < 0.30 and side in self.armed]
-        if len(candidates) == 1 and now >= self.block_until:
-            side = candidates[0]
-            if self.pending != side:
-                self.pending, self.since = side, now
-            elif now - self.since >= 0.12:
-                try:
-                    self.origin = self.mover.grab() if self.mover else (100, 100)
-                    self.owner = side
-                    self.anchor = self.filtered = states[side][1]
-                    self.last_time = now
-                    self.pending = None
-                    self.status = f'Grabbed focused window with {side}'
-                except RuntimeError as exc:
-                    self.release(now)
-                    self.status = str(exc)
+        if now < self.block_until:
+            self.mode = 'paused'
             return True
-        self.pending = None
-        # Suppress swipes while any hand is closed, even if it was not armed.
-        return now < self.block_until or any(ratio < 0.48 for ratio, _ in states.values())
+        if self.pending:
+            if ratio >= .30:
+                self.pending = None
+            else:
+                self.progress = min(1,(now-self.since)/.18)
+                self.mode = 'pinch'
+                if self.progress >= 1:
+                    self.owner, self.pending = side, None
+                    self.origin, self.anchor = self.box[:2], self.cursor
+                    self.mode = 'grab'
+                return True
+        # Retain precisely the highlighted target when the pinch begins.
+        try:
+            if self.mover:
+                self.mover.grab(self.cursor)
+                self.box = self.mover.bounds()
+            else:
+                self.box = (150,150,500,400)  # Dry-run demonstration only.
+            self.mode, self.progress = 'ready', 0
+            self.status = 'Blue outline: target | Pinch to grab'
+        except RuntimeError as exc:
+            self.box = None
+            self.mode = 'paused'
+            self.status = str(exc)
+        if ratio < .30 and side in self.armed and self.box:
+            self.pending, self.since = side, now
+            self.mode = 'pinch'
+            return True
+        return any(r < .48 for r,_ in states.values())
 
 
 class SwipeDetector:
@@ -342,8 +498,8 @@ def label(frame, text, position, color=(100, 255, 180), scale=0.5):
 
 def main():
     dry_run = "--dry-run" in sys.argv
-    if sys.platform != "darwin" and not dry_run:
-        raise RuntimeError("Space switching requires macOS. Use --dry-run for detection only.")
+    if sys.platform != "darwin":
+        raise RuntimeError("This desktop overlay requires macOS, including in dry-run mode.")
     keyboard = None
     if not dry_run:
         import pyautogui
@@ -351,7 +507,8 @@ def main():
     detectors = {side: SwipeDetector() for side in ("Left", "Right")}
     guard = TrackingGuard()
     mover = MacWindowMover() if not dry_run else None
-    drag = PinchDrag(mover, tuple(keyboard.size()) if keyboard else (1440, 900))
+    overlay = None
+    drag = None
     cooldown_until = 0.0
     last_gesture = "Ready: swipe horizontally"
     if not hasattr(mp, "solutions"):
@@ -359,6 +516,8 @@ def main():
 
     cap = cv2.VideoCapture(0)
     try:
+        overlay = DesktopOverlay()
+        drag = PinchDrag(mover, overlay.size)
         if not cap.isOpened():
             raise RuntimeError(
                 "Cannot open camera 0. Close other camera apps and allow camera "
@@ -412,6 +571,7 @@ def main():
                     keyboard.failSafeCheck()
                 drag_busy = drag.update(gesture_time, tracked, width, height,
                                         tracking_ok and gesture_time >= cooldown_until)
+                overlay.draw(drag.cursor, drag.box, drag.mode, drag.progress)
                 if not tracking_ok or drag_busy or gesture_time < cooldown_until:
                     for detector in detectors.values():
                         detector.reset()
@@ -500,6 +660,8 @@ def main():
                 if cv2.getWindowProperty(WINDOW, cv2.WND_PROP_VISIBLE) < 1:
                     break
     finally:
+        if overlay:
+            overlay.close()
         if mover:
             mover.close()
         cap.release()
