@@ -5,7 +5,7 @@ Install in a virtual environment:
     python3.12 -m venv .venv
     source .venv/bin/activate
     python -m pip install 'numpy<2' 'opencv-python==4.11.0.86' 'opencv-contrib-python==4.11.0.86' 'mediapipe==0.10.21' pyautogui pyobjc-framework-Cocoa pyobjc-framework-Quartz
-    python hand_tracker_visual_grab.py
+    python hand_tracker_two_monitors.py
 
 In System Settings > Privacy & Security, enable Camera and Accessibility
 for the terminal/app running Python, then restart it. Ensure Control+Left/Right
@@ -24,7 +24,11 @@ gray = paused/no movable target. Open your fingers before each pinch.
 Point at any visible normal window, even an inactive app, and pinch for 0.18
 seconds to lock the highlighted target. Focus does not determine the target.
 Open fingers to release. The other hand can still swipe when not pinching.
-Uses the primary display and normal movable windows, not full-screen windows.
+Maps the central 70% of the camera across the combined extended desktop.
+Works with normal movable windows on all connected displays. Display geometry
+uses logical points so Retina scaling does not multiply movement distances.
+Restart after connecting/disconnecting monitors or changing their arrangement.
+Use extended displays (mirroring shows the same desktop on both screens).
 Tracking ambiguity releases the grab. --dry-run shows a demo target and never
 moves windows or sends keyboard shortcuts. Requires pyobjc-framework-Cocoa.
 Z is wrist-relative depth scaled by image width, not physical distance.
@@ -214,15 +218,61 @@ class MacWindowMover:
         self.names.clear()
 
 
+class DesktopLayout:
+    """Global top-left coordinates, including negative display origins."""
+    def __init__(self, frames, visible=None):
+        self.frames = frames
+        self.visible = visible or frames
+        left = min(r[0] for r in frames)
+        top = min(r[1] for r in frames)
+        right = max(r[0]+r[2] for r in frames)
+        bottom = max(r[1]+r[3] for r in frames)
+        self.bounds = (left, top, right-left, bottom-top)
+
+    @staticmethod
+    def from_cocoa(rect, primary_top):
+        x,y,w,h = rect
+        return x, primary_top-y-h, w,h
+
+    @staticmethod
+    def nearest(point, frames, margin=0):
+        x,y = point
+        candidates = [(max(rx+margin,min(x,rx+rw-1-margin)),
+                       max(ry+margin,min(y,ry+rh-1-margin)))
+                      for rx,ry,rw,rh in frames]
+        return min(candidates,key=lambda p:(p[0]-x)**2+(p[1]-y)**2)
+
+    def map_hand(self, center):
+        x,y,w,h = self.bounds
+        u,v = [max(0,min(1,(n-.15)/.7)) for n in center]
+        # Project gaps between staggered monitors to the nearest visible edge.
+        return self.nearest((x+u*(w-1),y+v*(h-1)),self.frames)
+
+    def constrain_window(self, x, y, width):
+        # Keep a usable part of the title bar on a monitor, without confining
+        # the whole window to one screen while crossing between monitors.
+        offset = min(100,max(20,width/2))
+        px,py = self.nearest((x+offset,y+12),self.visible,8)
+        return px-offset,py-12
+
+
 class DesktopOverlay:
-    """Click-through Cocoa overlay; all coordinates are primary-display points."""
+    """One click-through overlay per display, using global desktop points."""
     def __init__(self):
         import AppKit as A
         self.A = A
         A.NSApplication.sharedApplication()
-        screen = A.NSScreen.screens()[0]
-        rect = screen.frame()
-        self.size = (rect.size.width, rect.size.height)
+        screens = list(A.NSScreen.screens())
+        if not screens:
+            raise RuntimeError('No displays detected')
+        def unpack(rect):
+            return rect.origin.x,rect.origin.y,rect.size.width,rect.size.height
+        primary = unpack(screens[0].frame())
+        primary_top = primary[1]+primary[3]
+        frames = [DesktopLayout.from_cocoa(unpack(screen.frame()),primary_top) for screen in screens]
+        visible = [DesktopLayout.from_cocoa(unpack(screen.visibleFrame()),primary_top) for screen in screens]
+        self.layout = DesktopLayout(frames,visible)
+        self.overlays = []
         class GrabOverlayView(A.NSView):
             def isFlipped(self):
                 return True
@@ -258,35 +308,47 @@ class DesktopOverlay:
                 except Exception as exc:
                     # Never let a Python exception escape a native drawing callback.
                     self.render_error = f"Desktop overlay drawing failed: {exc}"
-        self.view = GrabOverlayView.alloc().initWithFrame_(((0,0),self.size))
-        self.view.setAccessibilityElement_(False)
-        self.window = A.NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(rect, A.NSWindowStyleMaskBorderless, A.NSBackingStoreBuffered, False)
-        self.window.setReleasedWhenClosed_(False)
-        self.window.setOpaque_(False)
-        self.window.setBackgroundColor_(A.NSColor.clearColor())
-        self.window.setHasShadow_(False)
-        self.window.setIgnoresMouseEvents_(True)
-        self.window.setLevel_(A.NSStatusWindowLevel)
-        self.window.setCollectionBehavior_(A.NSWindowCollectionBehaviorCanJoinAllSpaces | A.NSWindowCollectionBehaviorFullScreenAuxiliary | A.NSWindowCollectionBehaviorIgnoresCycle)
-        self.window.setContentView_(self.view)
-        self.window.orderFrontRegardless()
+        try:
+            for screen, frame in zip(screens, frames):
+                view = GrabOverlayView.alloc().initWithFrame_(((0,0),(frame[2],frame[3])))
+                view.setAccessibilityElement_(False)
+                window = A.NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(screen.frame(), A.NSWindowStyleMaskBorderless, A.NSBackingStoreBuffered, False)
+                window.setReleasedWhenClosed_(False)
+                self.overlays.append((window,view,frame))
+                window.setOpaque_(False)
+                window.setBackgroundColor_(A.NSColor.clearColor())
+                window.setHasShadow_(False)
+                window.setIgnoresMouseEvents_(True)
+                window.setLevel_(A.NSStatusWindowLevel)
+                window.setCollectionBehavior_(A.NSWindowCollectionBehaviorCanJoinAllSpaces | A.NSWindowCollectionBehaviorFullScreenAuxiliary | A.NSWindowCollectionBehaviorIgnoresCycle)
+                window.setContentView_(view)
+                window.orderFrontRegardless()
+        except Exception:
+            self.close()
+            raise
+        print(f'Mapped {len(screens)} display(s); desktop bounds: {self.layout.bounds}',flush=True)
 
     def draw(self, cursor, box, mode, progress=0):
-        error = getattr(self.view, 'render_error', None)
-        if error:
-            raise RuntimeError(error)
-        self.view.state = (cursor, box, mode, progress)
-        self.view.setNeedsDisplay_(True)
-        self.window.displayIfNeeded()
+        for window,view,(sx,sy,sw,sh) in self.overlays:
+            error = getattr(view, 'render_error', None)
+            if error:
+                raise RuntimeError(error)
+            local_cursor = (cursor[0]-sx,cursor[1]-sy) if cursor else None
+            local_box = (box[0]-sx,box[1]-sy,box[2],box[3]) if box else None
+            view.state = (local_cursor,local_box,mode,progress)
+            view.setNeedsDisplay_(True)
+            window.displayIfNeeded()
 
     def close(self):
-        self.window.orderOut_(None)
-        self.window.close()
+        for window,view,frame in self.overlays:
+            window.orderOut_(None)
+            window.close()
+        self.overlays.clear()
 
 
 class PinchDrag:
-    def __init__(self, mover, screen_size):
-        self.mover, self.screen = mover, screen_size
+    def __init__(self, mover, layout):
+        self.mover, self.layout = mover, layout
         self.owner = self.pending = self.pointer_side = None
         self.cursor = self.box = None
         self.mode, self.progress = 'paused', 0
@@ -308,9 +370,9 @@ class PinchDrag:
         for side, joints, _ in tracked:
             distance = lambda a,b: math.hypot(joints[a][0]-joints[b][0], joints[a][1]-joints[b][1])
             ratio = distance(4,8)/max(distance(0,9),distance(5,17),1)
-            # Use the central 70% of the camera to reach the whole primary display.
+            # Map the central camera region across the full monitor arrangement.
             center = ((joints[4][0]+joints[8][0])/(2*width), (joints[4][1]+joints[8][1])/(2*height))
-            point = tuple(max(0,min(1,(v-.15)/.7))*(size-1) for v,size in zip(center,self.screen))
+            point = self.layout.map_hand(center)
             states[side] = ratio, point
         if not tracking_ok or not states:
             self.release(now)
@@ -331,6 +393,7 @@ class PinchDrag:
         dt = max(0,now-self.last_time)
         alpha = 1-math.exp(-dt/.045)
         self.cursor = point if self.cursor is None else tuple(a+alpha*(b-a) for a,b in zip(self.cursor,point))
+        self.cursor = self.layout.nearest(self.cursor,self.layout.frames)
         self.last_time = now
         self.armed.intersection_update(states)
         if ratio > .55:
@@ -342,7 +405,7 @@ class PinchDrag:
                 return True
             x = self.origin[0]+self.cursor[0]-self.anchor[0]
             y = self.origin[1]+self.cursor[1]-self.anchor[1]
-            x,y = max(0,min(x,self.screen[0]-100)),max(25,min(y,self.screen[1]-60))
+            x,y = self.layout.constrain_window(x,y,self.box[2])
             try:
                 if self.mover:
                     self.mover.move(round(x),round(y))
@@ -517,7 +580,7 @@ def main():
     cap = cv2.VideoCapture(0)
     try:
         overlay = DesktopOverlay()
-        drag = PinchDrag(mover, overlay.size)
+        drag = PinchDrag(mover, overlay.layout)
         if not cap.isOpened():
             raise RuntimeError(
                 "Cannot open camera 0. Close other camera apps and allow camera "
