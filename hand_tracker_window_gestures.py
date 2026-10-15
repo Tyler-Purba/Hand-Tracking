@@ -1,22 +1,22 @@
 #!/usr/bin/env python3
-"""Two-hand tracking with horizontal swipes to switch macOS Spaces. Use Python 3.10–3.12 with MediaPipe 0.10.21.
+"""Single-hand tracking with horizontal swipes to switch macOS Spaces. Use Python 3.10–3.12 with MediaPipe 0.10.21.
 
 Install in a virtual environment:
     python3.12 -m venv .venv
     source .venv/bin/activate
     python -m pip install 'numpy<2' 'opencv-python==4.11.0.86' 'opencv-contrib-python==4.11.0.86' 'mediapipe==0.10.21' pyautogui pyobjc-framework-Cocoa pyobjc-framework-Quartz
-    python hand_tracker_two_monitors.py
+    python hand_tracker_window_gestures.py
 
 In System Settings > Privacy & Security, enable Camera and Accessibility
 for the terminal/app running Python, then restart it. Ensure Control+Left/Right
 work manually (Keyboard > Keyboard Shortcuts > Mission Control).
 Swipe left in the mirrored view -> Control+Right; swipe right -> Control+Left.
-Either hand can trigger. Return your hand during the one-second cooldown.
+Use one hand at a time; either your left or right hand works. Return your hand during the one-second cooldown.
 Q quits when the preview is focused; Ctrl+C in the terminal also quits.
 Move the mouse to a screen corner to activate PyAutoGUI's fail-safe.
 Run with --dry-run to detect gestures without sending shortcuts.
-Gestures pause when hand boxes overlap, handedness is uncertain, or tracking
-jumps. Separate hands and allow 0.35 seconds of consistent tracking to rearm.
+Gestures pause when tracking is lost or palm geometry jumps. Allow 0.35
+seconds of stable tracking to rearm. Left/right labels are deliberately ignored.
 Raw landmark drawings/data are still shown and may jitter during occlusion.
 A desktop ring follows the thumb/index midpoint of one controlling hand.
 Blue outline = target; yellow filling ring = pinch registering; green = grabbed;
@@ -31,6 +31,16 @@ Restart after connecting/disconnecting monitors or changing their arrangement.
 Use extended displays (mirroring shows the same desktop on both screens).
 Tracking ambiguity releases the grab. --dry-run shows a demo target and never
 moves windows or sends keyboard shortcuts. Requires pyobjc-framework-Cocoa.
+Additional gestures act on the CURRENTLY FOCUSED window (click it first):
+- Show an open hand, then hold a closed fist for 0.65s to exit full screen.
+- Quickly spread all five fingers within 0.5s to enter full screen.
+There is a 1.5s cooldown. Actions pause while dragging or tracking is uncertain.
+Full-screen entry requires the app to expose a writable AXFullScreen attribute.
+Pinch dragging still targets the hovered window across all displays.
+Desktop rendering targets 120 Hz independently of MediaPipe detection speed.
+The camera is requested at 60 FPS, but hardware may deliver less. Pinching
+activates and raises the grabbed application. Overlays use nonactivating panels
+that can join other applications' full-screen Spaces.
 Z is wrist-relative depth scaled by image width, not physical distance.
 """
 
@@ -38,6 +48,8 @@ import sys
 import os
 import math
 import time
+import threading
+import queue
 from datetime import datetime
 from collections import deque
 
@@ -91,6 +103,8 @@ class MacWindowMover:
         bind(self.cf, 'CFArrayGetCount', C.c_long, [P])
         bind(self.cf, 'CFArrayGetValueAtIndex', P, [P, C.c_long])
         bind(self.ax, 'AXUIElementCreateApplication', P, [I])
+        bind(self.ax, 'AXUIElementGetPid', I, [P, C.POINTER(I)])
+        bind(self.ax, 'AXUIElementPerformAction', I, [P, P])
         bind(self.ax, 'AXUIElementCopyElementAtPosition', I, [P, C.c_float, C.c_float, C.POINTER(P)])
         bind(self.cf, 'CFBooleanGetValue', B, [P])
         bind(self.ax, 'AXIsProcessTrusted', B, [])
@@ -194,6 +208,47 @@ class MacWindowMover:
                 self.cf.CFRelease(ref)
         return tuple(values)
 
+    def focus_target(self):
+        import AppKit as A
+        pid = self.C.c_int()
+        if not self.window or self.ax.AXUIElementGetPid(self.window,self.C.byref(pid)):
+            raise RuntimeError('Cannot identify the grabbed application')
+        app = A.NSRunningApplication.runningApplicationWithProcessIdentifier_(pid.value)
+        if app is None or not app.activateWithOptions_(A.NSApplicationActivateIgnoringOtherApps):
+            raise RuntimeError('Could not activate the grabbed application')
+        error = self.ax.AXUIElementPerformAction(self.window,self.name('AXRaise'))
+        if error:
+            raise RuntimeError(f'Cannot raise the grabbed window ({error})')
+
+    def focused_action(self, action):
+        if not self.ax.AXIsProcessTrusted():
+            raise RuntimeError('Enable Accessibility for the terminal/app')
+        system = self.ax.AXUIElementCreateSystemWide()
+        app = window = None
+        try:
+            self.ax.AXUIElementSetMessagingTimeout(system, 0.15)
+            app = self.get(system, 'AXFocusedApplication')
+            self.ax.AXUIElementSetMessagingTimeout(app, 0.15)
+            window = self.get(app, 'AXFocusedWindow')
+            self.ax.AXUIElementSetMessagingTimeout(window, 0.15)
+            if action not in ('windowed', 'fullscreen'):
+                raise ValueError(f'Unknown window action: {action}')
+            attribute = 'AXFullScreen'
+            writable = self.C.c_bool()
+            error = self.ax.AXUIElementIsAttributeSettable(window,self.name(attribute),self.C.byref(writable))
+            if error or not writable.value:
+                raise RuntimeError(f'The focused window does not support {action}')
+            # Explicit state: fist exits full screen, spread enters it.
+            symbol = 'kCFBooleanTrue' if action == 'fullscreen' else 'kCFBooleanFalse'
+            desired = self.C.c_void_p.in_dll(self.cf,symbol).value
+            error = self.ax.AXUIElementSetAttributeValue(window,self.name(attribute),desired)
+            if error:
+                raise RuntimeError(f'{action} failed (Accessibility error {error})')
+        finally:
+            if window: self.cf.CFRelease(window)
+            if app: self.cf.CFRelease(app)
+            self.cf.CFRelease(system)
+
     def move(self, x, y):
         point = self.Point(x, y)
         value = self.ax.AXValueCreate(1, self.C.byref(point))
@@ -273,6 +328,9 @@ class DesktopOverlay:
         visible = [DesktopLayout.from_cocoa(unpack(screen.visibleFrame()),primary_top) for screen in screens]
         self.layout = DesktopLayout(frames,visible)
         self.overlays = []
+        self.target = (None,None,"paused",0)
+        self.shown_cursor = None
+        self.last_tick = time.monotonic()
         class GrabOverlayView(A.NSView):
             def isFlipped(self):
                 return True
@@ -312,15 +370,17 @@ class DesktopOverlay:
             for screen, frame in zip(screens, frames):
                 view = GrabOverlayView.alloc().initWithFrame_(((0,0),(frame[2],frame[3])))
                 view.setAccessibilityElement_(False)
-                window = A.NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(screen.frame(), A.NSWindowStyleMaskBorderless, A.NSBackingStoreBuffered, False)
+                window = A.NSPanel.alloc().initWithContentRect_styleMask_backing_defer_(screen.frame(), A.NSWindowStyleMaskBorderless | A.NSWindowStyleMaskNonactivatingPanel, A.NSBackingStoreBuffered, False)
                 window.setReleasedWhenClosed_(False)
                 self.overlays.append((window,view,frame))
                 window.setOpaque_(False)
                 window.setBackgroundColor_(A.NSColor.clearColor())
                 window.setHasShadow_(False)
+                window.setHidesOnDeactivate_(False)
+                window.setFloatingPanel_(True)
                 window.setIgnoresMouseEvents_(True)
                 window.setLevel_(A.NSStatusWindowLevel)
-                window.setCollectionBehavior_(A.NSWindowCollectionBehaviorCanJoinAllSpaces | A.NSWindowCollectionBehaviorFullScreenAuxiliary | A.NSWindowCollectionBehaviorIgnoresCycle)
+                window.setCollectionBehavior_(A.NSWindowCollectionBehaviorCanJoinAllSpaces | A.NSWindowCollectionBehaviorFullScreenAuxiliary | A.NSWindowCollectionBehaviorIgnoresCycle | getattr(A,"NSWindowCollectionBehaviorCanJoinAllApplications",0))
                 window.setContentView_(view)
                 window.orderFrontRegardless()
         except Exception:
@@ -329,6 +389,21 @@ class DesktopOverlay:
         print(f'Mapped {len(screens)} display(s); desktop bounds: {self.layout.bounds}',flush=True)
 
     def draw(self, cursor, box, mode, progress=0):
+        self.target = cursor,box,mode,progress
+
+    def tick(self):
+        now = time.monotonic()
+        dt = now-self.last_tick
+        if dt < 1/120:
+            return
+        self.last_tick = now
+        cursor,box,mode,progress = self.target
+        if cursor is None or self.shown_cursor is None:
+            self.shown_cursor = cursor
+        else:
+            alpha = 1-math.exp(-dt/.025)
+            self.shown_cursor = tuple(a+alpha*(b-a) for a,b in zip(self.shown_cursor,cursor))
+        cursor = self.shown_cursor
         for window,view,(sx,sy,sw,sh) in self.overlays:
             error = getattr(view, 'render_error', None)
             if error:
@@ -354,18 +429,20 @@ class PinchDrag:
         self.mode, self.progress = 'paused', 0
         self.armed = set()
         self.since = self.last_time = self.block_until = 0.0
+        self.open_since = None
         self.status = 'Point at a window, then pinch thumb + index'
 
     def release(self, now):
         if self.mover:
             self.mover.release()
         self.owner = self.pending = None
+        self.open_since = None
         self.box = None
         self.armed.clear()
         self.block_until = now + 0.4
         self.mode, self.progress = 'paused', 0
 
-    def update(self, now, tracked, width, height, tracking_ok):
+    def update(self, now, tracked, width, height, tracking_ok, allow_actions=True):
         states = {}
         for side, joints, _ in tracked:
             distance = lambda a,b: math.hypot(joints[a][0]-joints[b][0], joints[a][1]-joints[b][1])
@@ -377,7 +454,7 @@ class PinchDrag:
         if not tracking_ok or not states:
             self.release(now)
             self.cursor = None if not states else self.cursor
-            self.status = 'Paused: separate hands and wait for stable tracking'
+            self.status = 'Paused: show one hand and wait for stable tracking'
             return True
         if (self.owner or self.pending) and (self.owner or self.pending) not in states:
             self.release(now)
@@ -395,14 +472,29 @@ class PinchDrag:
         self.cursor = point if self.cursor is None else tuple(a+alpha*(b-a) for a,b in zip(self.cursor,point))
         self.cursor = self.layout.nearest(self.cursor,self.layout.frames)
         self.last_time = now
+        # Cursor motion continues even while gesture actions are locked out.
+        if not allow_actions:
+            if self.owner or self.pending:
+                self.release(now)
+            self.armed.clear()
+            self.box = None
+            self.mode, self.progress = 'ready', 0
+            self.status = 'Gesture in progress - cursor tracking active'
+            return True
         self.armed.intersection_update(states)
         if ratio > .55:
             self.armed.add(side)
         if self.owner:
-            if ratio > .48:
-                self.release(now)
-                self.status = 'Released'
+            if ratio > .55:
+                if self.open_since is None:
+                    self.open_since = now
+                if now-self.open_since >= .12:
+                    self.release(now)
+                    self.status = 'Released'
+                    return True
+                # Brief landmark noise must not drop or move the grabbed window.
                 return True
+            self.open_since = None
             x = self.origin[0]+self.cursor[0]-self.anchor[0]
             y = self.origin[1]+self.cursor[1]-self.anchor[1]
             x,y = self.layout.constrain_window(x,y,self.box[2])
@@ -428,6 +520,13 @@ class PinchDrag:
                 self.progress = min(1,(now-self.since)/.18)
                 self.mode = 'pinch'
                 if self.progress >= 1:
+                    try:
+                        if self.mover:
+                            self.mover.focus_target()
+                    except RuntimeError as exc:
+                        self.release(now)
+                        self.status = str(exc)
+                        return True
                     self.owner, self.pending = side, None
                     self.origin, self.anchor = self.box[:2], self.cursor
                     self.mode = 'grab'
@@ -450,6 +549,70 @@ class PinchDrag:
             self.mode = 'pinch'
             return True
         return any(r < .48 for r,_ in states.values())
+
+
+class WindowGestures:
+    """Require deliberate transitions; holding a pose never repeats an action."""
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.side = None
+        self.armed = False
+        self.fist_since = None
+        self.history = deque()
+        self.status = 'Fist 0.65s: exit full screen | Quick spread: full screen'
+
+    @staticmethod
+    def measure(joints):
+        def dist(a,b):
+            return math.hypot(joints[a][0]-joints[b][0], joints[a][1]-joints[b][1])
+        palm = max(dist(0,9),dist(5,17),1)
+        count = sum(dist(tip,0) > dist(pip,0)*1.15 for tip,pip in ((8,6),(12,10),(16,14),(20,18)))
+        spread = sum(dist(a,b) for a,b in ((8,12),(12,16),(16,20)))/palm
+        thumb_open = dist(4,17)/palm > 1.25
+        fist = count == 0 and dist(4,5)/palm < .85
+        return count,spread,thumb_open,fist
+
+    def update_pose(self, now, side, pose):
+        if side != self.side:
+            self.reset()
+            self.side = side
+        count,spread,thumb_open,fist = pose
+        # Show an open hand first; a fist already present on startup cannot act.
+        if count >= 3:
+            self.armed = True
+        while self.history and now-self.history[0][0] > .5:
+            self.history.popleft()
+        opened_fast = (count == 4 and thumb_open and spread > 1.05
+                       and any((count0 <= 1 or spread0 < .65) and spread-spread0 > .40
+                               for _,count0,spread0 in self.history))
+        if self.armed and opened_fast:
+            self.reset()
+            return 'fullscreen',True
+        self.history.append((now,count,spread))
+        if self.armed and fist:
+            if self.fist_since is None:
+                self.fist_since = now
+            held = now-self.fist_since
+            self.status = f'Hold fist: {min(held/.65,1):.0%}'
+            if held >= .65:
+                self.reset()
+                return 'windowed',True
+            return None,True
+        self.fist_since = None
+        self.status = 'Fist 0.65s: exit full screen | Quick spread: full screen'
+        return None,False
+
+    def update(self, now, tracked, enabled, preferred=None):
+        if not enabled or not tracked:
+            self.reset()
+            return None,False
+        sides = {side:joints for side,joints,_ in tracked}
+        side = self.side if self.side in sides else preferred
+        if side not in sides:
+            side = sorted(sides)[0]
+        return self.update_pose(now,side,self.measure(sides[side]))
 
 
 class SwipeDetector:
@@ -491,7 +654,7 @@ class SwipeDetector:
 
 
 class TrackingGuard:
-    """Conservatively pause gestures when hand identity/geometry is ambiguous."""
+    """Pause on missing or discontinuous palm tracking, not left/right labels."""
 
     def __init__(self):
         self.previous = {}
@@ -499,14 +662,12 @@ class TrackingGuard:
         self.stable_since = None
 
     def update(self, now, observations):
-        # Observations contain normalized coordinates and handedness confidence.
+        # Use palm geometry only; handedness confidence is not tracking confidence.
         current = {}
-        boxes = []
         reason = ""
-        for side, score, points in observations:
-            if side in current or score < 0.8:
-                reason = "Uncertain hand identity"
-            xs, ys = zip(*points)
+        for side, points in observations:
+            palm = [points[i] for i in (0, 5, 9, 13, 17)]
+            xs, ys = zip(*palm)
             box = (min(xs), min(ys), max(xs), max(ys))
             area = (box[2] - box[0]) * (box[3] - box[1])
             if area < 0.0001:
@@ -514,18 +675,10 @@ class TrackingGuard:
             center = tuple(sum(points[i][axis] for i in (0, 5, 9, 13, 17)) / 5
                            for axis in (0, 1))
             current[side] = (center, area)
-            boxes.append(box)
-        if len(boxes) == 2:
-            a, b = boxes
-            overlap = max(0, min(a[2], b[2]) - max(a[0], b[0])) * max(
-                0, min(a[3], b[3]) - max(a[1], b[1]))
-            smallest = min((b[2]-b[0])*(b[3]-b[1]) for b in boxes)
-            if overlap / max(smallest, 1e-9) > 0.15:
-                reason = "Hands overlap - separate them"
         if not current:
             reason = "Show a hand"
         elif current.keys() != self.previous.keys():
-            reason = reason or "Hand count or identity changed"
+            reason = reason or "Hand acquired"
         elif self.last_time is not None and now - self.last_time > 0.15:
             reason = reason or "Tracking interrupted"
         else:
@@ -559,6 +712,44 @@ def label(frame, text, position, color=(100, 255, 180), scale=0.5):
                 scale, color, 1, cv2.LINE_AA)
 
 
+class TrackingWorker:
+    """Latest frame only: model work never blocks the desktop's drawing loop."""
+    def __init__(self, cap):
+        self.cap = cap
+        self.stop = threading.Event()
+        self.latest = queue.Queue(maxsize=1)
+        self.thread = threading.Thread(target=self.run,daemon=True)
+
+    def publish(self, value):
+        try: self.latest.get_nowait()
+        except queue.Empty: pass
+        try: self.latest.put_nowait(value)
+        except queue.Full: pass
+
+    def run(self):
+        try:
+            with mp.solutions.hands.Hands(static_image_mode=False,max_num_hands=1,
+                    model_complexity=1,min_detection_confidence=.7,
+                    min_tracking_confidence=.7) as hands:
+                while not self.stop.is_set():
+                    ok,frame = self.cap.read()
+                    if not ok or frame is None:
+                        raise RuntimeError('Camera stopped returning frames')
+                    frame = cv2.flip(frame,1)
+                    rgb = cv2.cvtColor(frame,cv2.COLOR_BGR2RGB)
+                    rgb.flags.writeable = False
+                    result = hands.process(rgb)
+                    self.publish((frame,result))
+        except Exception as exc:
+            self.publish(exc)
+        finally:
+            self.cap.release()
+
+    def close(self):
+        self.stop.set()
+        self.thread.join(timeout=2)
+
+
 def main():
     dry_run = "--dry-run" in sys.argv
     if sys.platform != "darwin":
@@ -567,8 +758,9 @@ def main():
     if not dry_run:
         import pyautogui
         keyboard = pyautogui
-    detectors = {side: SwipeDetector() for side in ("Left", "Right")}
+    detectors = {side: SwipeDetector() for side in ("Hand",)}
     guard = TrackingGuard()
+    window_gestures = WindowGestures()
     mover = MacWindowMover() if not dry_run else None
     overlay = None
     drag = None
@@ -577,6 +769,7 @@ def main():
     if not hasattr(mp, "solutions"):
         raise RuntimeError("MediaPipe Hands requires mediapipe==0.10.21; see installation above.")
 
+    worker = None
     cap = cv2.VideoCapture(0)
     try:
         overlay = DesktopOverlay()
@@ -594,140 +787,169 @@ def main():
         drawing = mp.solutions.drawing_utils
         last_print = -float("inf")
 
-        with hands_api.Hands(
-            static_image_mode=False,
-            max_num_hands=2,
-            model_complexity=1,
-            min_detection_confidence=0.7,
-            min_tracking_confidence=0.7,
-        ) as hands:
-            while True:
-                ok, frame = cap.read()
-                if not ok or frame is None:
-                    raise RuntimeError("Camera stopped returning frames. Check its connection and permissions.")
+        cap.set(cv2.CAP_PROP_FPS,60)  # Request only; actual camera FPS varies.
+        worker = TrackingWorker(cap)
+        worker.thread.start()
+        last_packet = time.monotonic()
+        preview_shown = False
+        # Keep Cocoa/OpenCV rendering on the main thread, independent of inference.
+        while True:
+            overlay.tick()
+            key = cv2.waitKey(1) & 0xFF
+            if key in (ord('q'),ord('Q')):
+                break
+            if preview_shown and cv2.getWindowProperty(WINDOW,cv2.WND_PROP_VISIBLE) < 1:
+                break
+            try:
+                packet = worker.latest.get_nowait()
+            except queue.Empty:
+                if time.monotonic()-last_packet > .3:
+                    drag.release(time.monotonic())
+                    overlay.draw(None,None,'paused')
+                time.sleep(.001)
+                continue
+            if isinstance(packet,Exception):
+                raise packet
+            last_packet = time.monotonic()
+            frame,result = packet
+            height,width = frame.shape[:2]
+            tracked = []
+            observations = []
+            # Handedness matches the mirrored image passed to MediaPipe.
+            for index, hand in enumerate(result.multi_hand_landmarks or []):
+                side = "Hand"  # Stable identity: ignore MediaPipe left/right guesses.
+                observations.append((side, [(p.x, p.y) for p in hand.landmark]))
+                # X/Y use image width/height; Z uses width and each hand's wrist.
+                # Preserve raw values; clamp only the on-screen label placement.
+                coordinates = [
+                    (round(p.x * width), round(p.y * height), round(p.z * width))
+                    for p in hand.landmark
+                ]
+                fingertips = {name: coordinates[joint] for name, joint in TIPS.items()}
+                tracked.append((side, coordinates, fingertips))
 
-                frame = cv2.flip(frame, 1)  # Mirror the view for natural movement.
-                height, width = frame.shape[:2]
-                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                rgb.flags.writeable = False
-                result = hands.process(rgb)
-                tracked = []
-                observations = []
-                # Handedness matches the mirrored image passed to MediaPipe.
-                for index, hand in enumerate(result.multi_hand_landmarks or []):
-                    classification = result.multi_handedness[index].classification[0]
-                    side = classification.label
-                    observations.append((side, classification.score,
-                                         [(p.x, p.y) for p in hand.landmark]))
-                    # X/Y use image width/height; Z uses width and each hand's wrist.
-                    # Preserve raw values; clamp only the on-screen label placement.
-                    coordinates = [
-                        (round(p.x * width), round(p.y * height), round(p.z * width))
-                        for p in hand.landmark
-                    ]
-                    fingertips = {name: coordinates[joint] for name, joint in TIPS.items()}
-                    tracked.append((side, coordinates, fingertips))
+            gesture_time = time.monotonic()
+            tracking_ok, tracking_status = guard.update(gesture_time, observations)
+            if keyboard is not None:
+                keyboard.failSafeCheck()
+            action, pose_busy = window_gestures.update(
+                gesture_time, tracked,
+                tracking_ok and gesture_time >= cooldown_until and not drag.owner,
+                drag.pointer_side)
+            if action:
+                try:
+                    if mover:
+                        mover.focused_action(action)
+                    last_gesture = f'{action}: focused window' + (' (dry run)' if dry_run else '')
+                except RuntimeError as exc:
+                    last_gesture = str(exc)
+                print(last_gesture,flush=True)
+                cooldown_until = time.monotonic()+1.5
+                drag.release(gesture_time)
+            drag_busy = drag.update(
+                gesture_time, tracked, width, height, tracking_ok,
+                allow_actions=not pose_busy and gesture_time >= cooldown_until)
+            if pose_busy:
+                drag.status = window_gestures.status
+            overlay.draw(drag.cursor, drag.box, drag.mode, drag.progress)
+            if not tracking_ok or drag_busy or gesture_time < cooldown_until:
+                for detector in detectors.values():
+                    detector.reset()
+            else:
+                for side, detector in detectors.items():
+                    matches = [item for item in tracked if item[0] == side]
+                    if len(matches) != 1:
+                        detector.reset()  # Missing/ambiguous handedness cannot share a path.
+                        continue
+                    joints = matches[0][1]
+                    # Average wrist and four knuckles for a stable palm center.
+                    center_x = sum(joints[i][0] for i in (0, 5, 9, 13, 17)) / (5 * width)
+                    center_y = sum(joints[i][1] for i in (0, 5, 9, 13, 17)) / (5 * height)
+                    direction = detector.update(gesture_time, center_x, center_y)
+                    if direction:
+                        arrow = "right" if direction == "left" else "left"
+                        if keyboard is not None:
+                            send_swipe(direction, keyboard)
+                        last_gesture = f"{side} swipe {direction} -> Ctrl+{arrow}"
+                        if dry_run:
+                            last_gesture += " (dry run)"
+                        print(last_gesture, flush=True)
+                        cooldown_until = time.monotonic() + COOLDOWN_SECONDS
+                        for other in detectors.values():
+                            other.reset()
+                        break  # A shared cooldown prevents simultaneous hand triggers.
 
-                gesture_time = time.monotonic()
-                tracking_ok, tracking_status = guard.update(gesture_time, observations)
-                if keyboard is not None:
-                    keyboard.failSafeCheck()
-                drag_busy = drag.update(gesture_time, tracked, width, height,
-                                        tracking_ok and gesture_time >= cooldown_until)
-                overlay.draw(drag.cursor, drag.box, drag.mode, drag.progress)
-                if not tracking_ok or drag_busy or gesture_time < cooldown_until:
-                    for detector in detectors.values():
-                        detector.reset()
+            # Sort for consistent display order; these are detections, not persistent IDs.
+            tracked.sort(key=lambda item: (item[0], item[1][0][0]))
+            for index, (side, coordinates, fingertips) in enumerate(tracked):
+                color = (100, 255, 180)
+                for name, (x, y, z) in fingertips.items():
+                    text = f"{side} {index + 1} {name}: ({x}, {y})"
+                    (tw, th), baseline = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+                    position = (max(0, min(x + 10, width - tw - 4)),
+                                max(th + 4, min(y - 12, height - baseline - 4)))
+                    label(frame, text, position, color=color)
+            for hand in result.multi_hand_landmarks or []:
+                drawing.draw_landmarks(frame, hand, hands_api.HAND_CONNECTIONS)
+
+            # One coordinate panel for the single tracked hand.
+            canvas = cv2.copyMakeBorder(frame, 0, max(0, 680 - height), 0, 440,
+                                        cv2.BORDER_CONSTANT, value=(24, 24, 24))
+            for panel in range(1):
+                left = width + panel * 440 + 12
+                if panel < len(tracked):
+                    side, coordinates, _ = tracked[panel]
+                    title = f"Hand {panel + 1}: {side}"
                 else:
-                    for side, detector in detectors.items():
-                        matches = [item for item in tracked if item[0] == side]
-                        if len(matches) != 1:
-                            detector.reset()  # Missing/ambiguous handedness cannot share a path.
-                            continue
-                        joints = matches[0][1]
-                        # Average wrist and four knuckles for a stable palm center.
-                        center_x = sum(joints[i][0] for i in (0, 5, 9, 13, 17)) / (5 * width)
-                        center_y = sum(joints[i][1] for i in (0, 5, 9, 13, 17)) / (5 * height)
-                        direction = detector.update(gesture_time, center_x, center_y)
-                        if direction:
-                            arrow = "right" if direction == "left" else "left"
-                            if keyboard is not None:
-                                send_swipe(direction, keyboard)
-                            last_gesture = f"{side} swipe {direction} -> Ctrl+{arrow}"
-                            if dry_run:
-                                last_gesture += " (dry run)"
-                            print(last_gesture, flush=True)
-                            cooldown_until = time.monotonic() + COOLDOWN_SECONDS
-                            for other in detectors.values():
-                                other.reset()
-                            break  # A shared cooldown prevents simultaneous hand triggers.
+                    coordinates = None
+                    title = f"Hand {panel + 1}: Not detected"
+                label(canvas, title, (left, 28))
+                label(canvas, "ID / JOINT                 X     Y     Z*", (left, 55), scale=0.45)
+                for joint in hands_api.HandLandmark:
+                    values = coordinates[joint.value] if coordinates else None
+                    row = (f"{joint.value:02d} {joint.name:<17} "
+                           + (f"{values[0]:5d} {values[1]:5d} {values[2]:5d}" if values else "  --    --    --"))
+                    label(canvas, row, (left, 82 + joint.value * 25), scale=0.43)
+                label(canvas, "*Z: relative to this hand's wrist", (left, 625), scale=0.45)
+                label(canvas, "Q: quit | Mirrored image coordinates", (left, 650), scale=0.43)
+            label(canvas, f"Tracking {len(tracked)}/1 hand", (12, 28))
 
-                # Sort for consistent display order; these are detections, not persistent IDs.
-                tracked.sort(key=lambda item: (item[0], item[1][0][0]))
-                for index, (side, coordinates, fingertips) in enumerate(tracked):
-                    color = (100, 255, 180) if side == "Left" else (255, 190, 100)
-                    for name, (x, y, z) in fingertips.items():
-                        text = f"{side} {index + 1} {name}: ({x}, {y})"
-                        (tw, th), baseline = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-                        position = (max(0, min(x + 10, width - tw - 4)),
-                                    max(th + 4, min(y - 12, height - baseline - 4)))
-                        label(frame, text, position, color=color)
-                for hand in result.multi_hand_landmarks or []:
-                    drawing.draw_landmarks(frame, hand, hands_api.HAND_CONNECTIONS)
+            remaining = max(0.0, cooldown_until - time.monotonic())
+            label(canvas, last_gesture, (12, 55))
+            status = f"Cooldown: {remaining:.1f}s" if remaining else tracking_status
+            label(canvas, status, (12, 82))
+            label(canvas, drag.status, (12, 109), scale=0.45)
+            label(canvas, window_gestures.status, (12, 136), scale=0.45)
+            now = time.monotonic()
+            if now - last_print >= 0.5:
+                stamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+                if tracked:
+                    lines = []
+                    for index, (side, _, fingertips) in enumerate(tracked):
+                        lines.append(f"[{stamp}] Hand {index + 1} ({side}) " + " | ".join(
+                            f"{name}: ({x}, {y}, {z})"
+                            for name, (x, y, z) in fingertips.items()
+                        ))
+                    print("\n".join(lines), flush=True)
+                else:
+                    print(f"[{stamp}] No hands detected", flush=True)
+                last_print = now
 
-                # Both panels show all 21 joints, with no stale data for missing hands.
-                canvas = cv2.copyMakeBorder(frame, 0, max(0, 680 - height), 0, 880,
-                                            cv2.BORDER_CONSTANT, value=(24, 24, 24))
-                for panel in range(2):
-                    left = width + panel * 440 + 12
-                    if panel < len(tracked):
-                        side, coordinates, _ = tracked[panel]
-                        title = f"Hand {panel + 1}: {side}"
-                    else:
-                        coordinates = None
-                        title = f"Hand {panel + 1}: Not detected"
-                    label(canvas, title, (left, 28))
-                    label(canvas, "ID / JOINT                 X     Y     Z*", (left, 55), scale=0.45)
-                    for joint in hands_api.HandLandmark:
-                        values = coordinates[joint.value] if coordinates else None
-                        row = (f"{joint.value:02d} {joint.name:<17} "
-                               + (f"{values[0]:5d} {values[1]:5d} {values[2]:5d}" if values else "  --    --    --"))
-                        label(canvas, row, (left, 82 + joint.value * 25), scale=0.43)
-                    label(canvas, "*Z: relative to this hand's wrist", (left, 625), scale=0.45)
-                    label(canvas, "Q: quit | Mirrored image coordinates", (left, 650), scale=0.43)
-                label(canvas, f"Tracking {len(tracked)}/2 hands", (12, 28))
-
-                remaining = max(0.0, cooldown_until - time.monotonic())
-                label(canvas, last_gesture, (12, 55))
-                status = f"Cooldown: {remaining:.1f}s" if remaining else tracking_status
-                label(canvas, status, (12, 82))
-                label(canvas, drag.status, (12, 109), scale=0.45)
-                now = time.monotonic()
-                if now - last_print >= 0.5:
-                    stamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-                    if tracked:
-                        lines = []
-                        for index, (side, _, fingertips) in enumerate(tracked):
-                            lines.append(f"[{stamp}] Hand {index + 1} ({side}) " + " | ".join(
-                                f"{name}: ({x}, {y}, {z})"
-                                for name, (x, y, z) in fingertips.items()
-                            ))
-                        print("\n".join(lines), flush=True)
-                    else:
-                        print(f"[{stamp}] No hands detected", flush=True)
-                    last_print = now
-
-                cv2.imshow(WINDOW, canvas)
-                if cv2.waitKey(1) & 0xFF in (ord("q"), ord("Q")):
-                    break
-                if cv2.getWindowProperty(WINDOW, cv2.WND_PROP_VISIBLE) < 1:
-                    break
+            cv2.imshow(WINDOW, canvas)
+            preview_shown = True
+            if cv2.waitKey(1) & 0xFF in (ord("q"), ord("Q")):
+                break
+            if cv2.getWindowProperty(WINDOW, cv2.WND_PROP_VISIBLE) < 1:
+                break
     finally:
+        if worker:
+            worker.close()
         if overlay:
             overlay.close()
         if mover:
             mover.close()
-        cap.release()
+        if worker is None:
+            cap.release()
         cv2.destroyAllWindows()
 
 
